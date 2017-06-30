@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/aead/chacha20"
+	"github.com/go-errors/errors"
 	"github.com/roasbeef/btcd/btcec"
 	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcutil"
@@ -52,6 +53,11 @@ const (
 	// used, then the remainder is padded with null-bytes, also obfuscated.
 	routingInfoSize = NumMaxHops * hopDataSize
 
+	// E2EPayloadSize is the size of the blob of data, which hops want to
+	// share with each other. The exact interpretation of the meaning of this
+	// data, should be defined on the application layer.
+	E2EPayloadSize = 100
+
 	// numStreamBytes is the number of bytes produced by our CSPRG for the
 	// key stream implementing our stream cipher to encrypt/decrypt the mix
 	// header. The last hopDataSize bytes are only used in order to
@@ -64,7 +70,11 @@ const (
 	keyLen = 32
 
 	// baseVersion represent the current supported version of onion packet.
-	baseVersion = 0
+	baseVersion byte = 0
+
+	// e2ePayloadVersion is the version of the onion packet which includes
+	// e2e payload.
+	e2ePayloadVersion byte = 1
 )
 
 var (
@@ -104,6 +114,11 @@ type OnionPacket struct {
 	// This encodes all the forwarding instructions for this current hop
 	// and all the hops in the route.
 	RoutingInfo [routingInfoSize]byte
+
+	// E2EPayload is the blob of data, which sender wants to share with receiver.
+	// The exact interpretation of the meaning of this data, should be defined
+	// on the application layer.
+	E2EPayload [E2EPayloadSize]byte
 
 	// HeaderMAC is an HMAC computed with the shared secret of the routing
 	// data and the associated data for this route. Including the
@@ -250,7 +265,12 @@ func generateSharedSecrets(paymentPath []*btcec.PublicKey,
 // obliviously routing a message through the mix-net path outline by
 // 'paymentPath'.
 func NewOnionPacket(paymentPath []*btcec.PublicKey, sessionKey *btcec.PrivateKey,
-	hopsData []HopData, assocData []byte) (*OnionPacket, error) {
+	hopsData []HopData, assocData []byte, e2ePayload []byte) (*OnionPacket, error) {
+
+	if len(e2ePayload) > E2EPayloadSize {
+		return nil, errors.Errorf("e2e payload is too big: %v > %v",
+			len(e2ePayload), E2EPayloadSize)
+	}
 
 	numHops := len(paymentPath)
 	hopSharedSecrets := generateSharedSecrets(paymentPath, sessionKey)
@@ -320,12 +340,20 @@ func NewOnionPacket(paymentPath []*btcec.PublicKey, sessionKey *btcec.PrivateKey
 		hopDataBuf.Reset()
 	}
 
-	return &OnionPacket{
-		Version:      baseVersion,
+	onionPacket := &OnionPacket{
 		EphemeralKey: sessionKey.PubKey(),
 		RoutingInfo:  mixHeader,
 		HeaderMAC:    nextHmac,
-	}, nil
+	}
+
+	if e2ePayload != nil {
+		copy(onionPacket.E2EPayload[:], e2ePayload)
+		onionPacket.Version = e2ePayloadVersion
+	} else {
+		onionPacket.Version = baseVersion
+	}
+
+	return onionPacket, nil
 }
 
 // Shift the byte-slice by the given number of bytes to the right and 0-fill
@@ -383,6 +411,12 @@ func (f *OnionPacket) Encode(w io.Writer) error {
 		return err
 	}
 
+	if f.Version >= e2ePayloadVersion {
+		if _, err := w.Write(f.E2EPayload[:]); err != nil {
+			return err
+		}
+	}
+
 	if _, err := w.Write(f.HeaderMAC[:]); err != nil {
 		return err
 	}
@@ -405,7 +439,7 @@ func (f *OnionPacket) Decode(r io.Reader) error {
 
 	// If version of the onion packet protocol unknown for us than in might
 	// lead to improperly decoded data.
-	if f.Version != baseVersion {
+	if f.Version > e2ePayloadVersion {
 		return ErrInvalidOnionVersion
 	}
 
@@ -420,6 +454,12 @@ func (f *OnionPacket) Decode(r io.Reader) error {
 
 	if _, err := io.ReadFull(r, f.RoutingInfo[:]); err != nil {
 		return err
+	}
+
+	if f.Version >= e2ePayloadVersion {
+		if _, err := io.ReadFull(r, f.E2EPayload[:]); err != nil {
+			return err
+		}
 	}
 
 	if _, err := io.ReadFull(r, f.HeaderMAC[:]); err != nil {
@@ -592,6 +632,12 @@ type ProcessedPacket struct {
 	// NOTE: This field will only be populated iff the above Action is
 	// MoreHops.
 	NextPacket *OnionPacket
+
+	// E2EPayload is the blob of data, which sender wants to share with receiver.
+	// The exact interpretation of the meaning of this data, should be defined
+	// on the application layer.
+	// NOTE: Populated only on the last hop.
+	E2EPayload [E2EPayloadSize]byte
 }
 
 // Router is an onion router within the Sphinx network. The router is capable
@@ -705,30 +751,33 @@ func (r *Router) ProcessOnionPacket(onionPkt *OnionPacket, assocData []byte) (*P
 		return nil, err
 	}
 
-	// With the necessary items extracted, we'll copy of the onion packet
-	// for the next node, snipping off our per-hop data.
-	var nextMixHeader [routingInfoSize]byte
-	copy(nextMixHeader[:], hopInfo[hopDataSize:])
-	nextFwdMsg := &OnionPacket{
-		Version:      onionPkt.Version,
-		EphemeralKey: nextDHKey,
-		RoutingInfo:  nextMixHeader,
-		HeaderMAC:    hopData.HMAC,
-	}
-
 	// By default we'll assume that there are additional hops in the route.
 	// However if the uncovered 'nextMac' is all zeroes, then this
 	// indicates that we're the final hop in the route.
-	var action ProcessCode = MoreHops
-	if bytes.Compare(bytes.Repeat([]byte{0x00}, hmacSize), hopData.HMAC[:]) == 0 {
-		action = ExitNode
+	processedPacket := &ProcessedPacket{
+		ForwardingInstructions: hopData,
 	}
 
-	return &ProcessedPacket{
-		Action:                 action,
-		ForwardingInstructions: hopData,
-		NextPacket:             nextFwdMsg,
-	}, nil
+	if bytes.Compare(bytes.Repeat([]byte{0x00}, hmacSize), hopData.HMAC[:]) == 0 {
+		processedPacket.Action = ExitNode
+		processedPacket.E2EPayload = onionPkt.E2EPayload
+	} else {
+		// With the necessary items extracted, we'll copy of the onion packet
+		// for the next node, snipping off our per-hop data.
+		var nextMixHeader [routingInfoSize]byte
+		copy(nextMixHeader[:], hopInfo[hopDataSize:])
+
+		processedPacket.Action = MoreHops
+		processedPacket.NextPacket = &OnionPacket{
+			Version:      onionPkt.Version,
+			EphemeralKey: nextDHKey,
+			RoutingInfo:  nextMixHeader,
+			E2EPayload:   onionPkt.E2EPayload,
+			HeaderMAC:    hopData.HMAC,
+		}
+	}
+
+	return processedPacket, nil
 }
 
 // generateSharedSecret generates the shared secret by given ephemeral key.

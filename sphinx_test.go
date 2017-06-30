@@ -46,7 +46,9 @@ func newTestRoute(numHops int) ([]*Router, *[]HopData, *OnionPacket, error) {
 	// generated intermdiates nodes above.  Destination should be Hash160,
 	// adding padding so parsing still works.
 	sessionKey, _ := btcec.PrivKeyFromBytes(btcec.S256(), bytes.Repeat([]byte{'A'}, 32))
-	fwdMsg, err := NewOnionPacket(route, sessionKey, hopsData, nil)
+	e2ePayload := bytes.Repeat([]byte("C"), E2EPayloadSize)
+	fwdMsg, err := NewOnionPacket(route, sessionKey, hopsData, nil,
+		e2ePayload)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("Unable to create forwarding "+
 			"message: %#v", err)
@@ -90,6 +92,11 @@ func TestSphinxCorrectness(t *testing.T) {
 					"the path, yet it doesn't recognize so", i)
 			}
 
+			expectedPayload := bytes.Repeat([]byte("C"), E2EPayloadSize)
+			if !bytes.Equal(onionPacket.E2EPayload[:], expectedPayload) {
+				t.Fatalf("Processing error, node %v is the last hop in "+
+					"the path, yet e2e payload is wrong", i)
+			}
 		} else {
 			// If this isn't the last node in the path, then the
 			// returned action should indicate that there are more
@@ -107,6 +114,11 @@ func TestSphinxCorrectness(t *testing.T) {
 					" next hop should be %v, was instead parsed as %v",
 					hex.EncodeToString(nodes[i+1].nodeID[:]),
 					hex.EncodeToString(parsedNextHop))
+			}
+
+			expectedPayload := bytes.Repeat([]byte{byte(0)}, E2EPayloadSize)
+			if !bytes.Equal(onionPacket.E2EPayload[:], expectedPayload[:]) {
+				t.Fatalf("Processing error, e2e payload shouldn't be set")
 			}
 
 			fwdMsg = onionPacket.NextPacket
